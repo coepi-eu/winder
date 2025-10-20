@@ -100,13 +100,13 @@ class Wind:
             self.m3_slow_wind_torque = 0.03
             self.m3_pull_wire_torque = self.config["motor"]["M3"]["pull_wire_torque"]
 
-    def calculate_motor_position_in_simulation(self, motor_id):
+    def calculate_motor_position_in_simulation(self, motor_id, timestamp=None):
         target_position = self.motor_positions[motor_id]
         velocity = self.motor_velocities[motor_id]
         motor_position_in_simulation = self.motor_positions_in_simulation[motor_id]
-        time_diff = (
-            datetime.now() - motor_position_in_simulation.timestamp
-        ).total_seconds()
+        if timestamp is None:
+            timestamp = datetime.now()
+        time_diff = (timestamp - motor_position_in_simulation.timestamp).total_seconds()
         position_diff = target_position - motor_position_in_simulation.position
         if abs(position_diff) < 0.01:
             return target_position
@@ -138,25 +138,27 @@ class Wind:
         motor_target = round(motor_target, round_to)
         command = f"M{motor_id}A{motor_target}\n"
 
-        self.motor_positions[motor_id] = target
-
         if self.simulation:
+            timestamp = datetime.now()
+            motor_position_in_simulation = self.calculate_motor_position_in_simulation(
+                motor_id, timestamp
+            )
             self.motor_positions_in_simulation[motor_id] = MotorPosition(
                 motor_id=motor_id,
-                position=self.calculate_motor_position_in_simulation(motor_id),
-                timestamp=datetime.now(),
+                position=motor_position_in_simulation,
+                timestamp=timestamp,
             )
             self.logger.debug(f"Simulation mode: {command.strip()}")
             update_motor_target(self.conn, motor_id, target)
             if motor_id != 2 and motor_id != 3:
                 # motor 3 is for wire tension, we don't care about its position
-                motor_position_in_simulation = (
-                    self.calculate_motor_position_in_simulation(motor_id)
-                )
                 update_motor_position(self.conn, motor_id, motor_position_in_simulation)
-            return
-        self.ser.write(bytes(command, "utf-8"))
-        self.logger.debug(command.strip())
+
+        else:
+            self.ser.write(bytes(command, "utf-8"))
+            self.logger.debug(command.strip())
+
+        self.motor_positions[motor_id] = target
 
     def init_position(self, pull_wire=False):
         """
@@ -473,7 +475,7 @@ class Wind:
         self.logger.info(f"Winding slot {slot_idx} done")
 
         # move motor 2 to the left to prevent collision
-        skip_prevent_collision_slot_idx = [15, 19, 23]
+        skip_prevent_collision_slot_idx = [23]
         if slot_idx not in skip_prevent_collision_slot_idx:
             self.prevent_collision(clockwise)
         sleep(0.7)
@@ -509,14 +511,7 @@ class Wind:
 
             self.wind_slot(slot_idx, clockwise, i)
 
-        if wire_idx != 2:
-            self.wind_wire_around_shaft(wire_idx)
-            self.motor2_pos = Motor2State.TOP
-
-        # Back to zero
-        self.move_motor(0, self.m0_zero)
-        # self.move_motor(2, self.m2_zero)
-        self.logger.info("Winding done")
+        self.logger.info(f"Winding wire {wire_idx} done")
 
     def wind_wire_around_shaft(self, wire_idx: int):
         # Move M1
@@ -536,6 +531,22 @@ class Wind:
         self.m1_zero += motor1_rotation
         sleep(1.5)
 
+        if self.motor2_pos == Motor2State.TOP_LEFT:
+            self.move_motor(
+                2, self.motor_positions[2] + self.m2_angle_to_prevent_collision
+            )
+        elif self.motor2_pos == Motor2State.TOP_RIGHT:
+            self.move_motor(
+                2, self.motor_positions[2] - self.m2_angle_to_prevent_collision
+            )
+        else:
+            self.logger.warning("motor2_pos is not TOP_LEFT or TOP_RIGHT")
+            self.logger.warning(
+                f"motor2_pos: {self.motor_positions[2]}, self.motor2_pos: {self.motor2_pos}"
+            )
+            raise Exception("motor2_pos is not TOP_LEFT or TOP_RIGHT")
+        sleep(0.5)
+        self.motor2_pos = Motor2State.TOP
         motor2_pos = self.get_motor_position(2)
         self.m2_zero = motor2_pos
 
@@ -543,8 +554,10 @@ class Wind:
         self.init_position(True)
 
         self.wind(0)
+        self.wind_wire_around_shaft(0)
         self.starts_at = 0
         self.wind(1)
+        self.wind_wire_around_shaft(1)
         self.wind(2)
 
     def close(self):
