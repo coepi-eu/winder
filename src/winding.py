@@ -2,7 +2,12 @@ import serial
 from time import sleep
 import math
 from .config import rotating_directions, m2_gear_ratio
-from .utils import init_logger, load_config, get_wind_orders_and_slot_indices
+from .utils import (
+    init_logger,
+    load_config,
+    get_wind_orders_and_slot_indices,
+    is_starting_from_bottom,
+)
 from enum import Enum
 from datetime import datetime
 from pydantic import BaseModel
@@ -171,6 +176,10 @@ class Wind:
         sleep(wait_time)
         self.move_motor(3, self.m3_wind_torque)
 
+    def release_wire_tension(self):
+        # release the wire tension
+        self.move_motor(3, 0)
+
     def estop(self):
         """
         Stop all motors
@@ -303,7 +312,7 @@ class Wind:
     def move_wire_to_right_position(self, slot_idx):
         # move to slot_idx - 1 and rotate motor2 by 180 degrees clockwise
         self.move_to_slot(slot_idx - 1)
-        sleep(0.5)
+        sleep(0.7)
         self.move_motor(0, self.m0_wind_range[0])
         sleep(1)
         if self.motor2_pos == Motor2State.TOP_LEFT:
@@ -327,7 +336,7 @@ class Wind:
         ), f"motor2_pos: {motor2_pos}, target_motor2_pos: {target_motor2_pos}"
 
         self.move_motor(0, self.m1_rotating_position)
-        sleep(0.5)
+        sleep(1.0)
 
     def set_motor2_wire_position(self):
         if self.motor2_pos == Motor2State.TOP_LEFT:
@@ -368,12 +377,17 @@ class Wind:
         ), f"motor0_target: {motor0_target} is out of range {self.m0_wind_range}"
         return motor0_target
 
-    def prevent_collision(self):
-        if self.is_motor2_at_12oclock():
+    def prevent_collision(self, clockwise):
+        if self.is_motor2_at_12oclock() and not clockwise:
             self.move_motor(
                 2, self.motor_positions[2] - self.m2_angle_to_prevent_collision
             )
             self.motor2_pos = Motor2State.TOP_LEFT
+        elif self.is_motor2_at_12oclock() and clockwise:
+            self.move_motor(
+                2, self.motor_positions[2] + self.m2_angle_to_prevent_collision
+            )
+            self.motor2_pos = Motor2State.TOP_RIGHT
         else:
             self.move_motor(
                 2, self.motor_positions[2] + self.m2_angle_to_prevent_collision
@@ -396,32 +410,37 @@ class Wind:
         step = math.pi * 2 / steps_per_rotation * (1 if clockwise else -1)
         for i in range(rotating_count * steps_per_rotation):
             self.move_motor(2, self.motor_positions[2] + step)
+            if self.simulation:
+                self.get_motor_position(2)
             sleep(0.05)
 
+    def get_init_motor2_pos(self):
+        current_motor2_pos = self.get_motor_position(2)
+        assert (
+            abs(current_motor2_pos - self.motor_positions[2]) < 0.1
+        ), f"current_motor2_pos: {current_motor2_pos}, self.motor_positions[2]: {self.motor_positions[2]}"
+
+        if self.motor2_pos == Motor2State.TOP_RIGHT:
+            return current_motor2_pos - self.m2_angle_to_prevent_collision
+        if self.motor2_pos == Motor2State.BOTTOM_RIGHT:
+            return current_motor2_pos + self.m2_angle_to_prevent_collision
+        return current_motor2_pos
+
     def wind_slot(self, slot_idx: int, clockwise, wind_idx):
-        # rotate motor1
         if wind_idx == int(self.wind_slot_count / 2) and not clockwise:
             self.move_wire_to_right_position(slot_idx)
 
+        # rotate motor1
         self.move_to_slot(slot_idx)
-        self.set_wire_tension()
+        self.set_wire_tension(1)
         self.move_motor(0, self.m0_wind_range[1])
-        sleep(0.3)
+        sleep(0.8)
         self.set_motor2_wire_position()
         sleep(0.2)
         self.move_motor(0, self.m0_wind_range[0])
-        sleep(0.7)
+        sleep(1.2)
 
-        init_motor2_pos = self.get_motor_position(2)
-        assert (
-            abs(init_motor2_pos - self.motor_positions[2]) < 0.1
-        ), f"init_motor2_pos: {init_motor2_pos}, self.motor_positions[2]: {self.motor_positions[2]}"
-
-        if self.motor2_pos == Motor2State.TOP_RIGHT:
-            init_motor2_pos = init_motor2_pos - self.m2_angle_to_prevent_collision
-        elif self.motor2_pos == Motor2State.BOTTOM_RIGHT:
-            init_motor2_pos = init_motor2_pos + self.m2_angle_to_prevent_collision
-
+        init_motor2_pos = self.get_init_motor2_pos()
         target_motor2_pos = self.get_target_motor2_pos(clockwise, wind_idx)
         # self.slow_winding(clockwise)
         self.fast_winding(clockwise)
@@ -445,7 +464,7 @@ class Wind:
                     continue
                 break
 
-        sleep(0.3)
+        sleep(0.5)
         motor2_pos = self.get_motor_position(2)
         assert (
             abs(motor2_pos - target_motor2_pos) < 0.1
@@ -454,25 +473,13 @@ class Wind:
         self.logger.info(f"Winding slot {slot_idx} done")
 
         # move motor 2 to the left to prevent collision
-        skip_prevent_collision_slot_idx = [3, 11, 15, 19, 23]
+        skip_prevent_collision_slot_idx = [15, 19, 23]
         if slot_idx not in skip_prevent_collision_slot_idx:
-            self.prevent_collision()
-        sleep(0.3)
-
-        self.move_motor(0, self.m1_rotating_position)
+            self.prevent_collision(clockwise)
         sleep(0.7)
 
-    def is_starting_from_bottom(self, starts_at: int, wire_idx: int):
-        # when starting from 2, 5, 7 for wire A
-        starts_at_from_bottom_a_c = [2, 5, 7]
-        if wire_idx != 1 and starts_at in starts_at_from_bottom_a_c:
-            return True
-
-        # when starting from 1, 3 for wire B
-        starts_at_from_bottom_b = [1, 3, 6]
-        if wire_idx == 1 and starts_at in starts_at_from_bottom_b:
-            return True
-        return False
+        self.move_motor(0, self.m1_rotating_position)
+        sleep(1.5)
 
     def wind(self, wire_idx: int):
         wind_order = self.wind_orders[wire_idx]
@@ -482,19 +489,22 @@ class Wind:
         self.move_to_slot(start_slot_idx)
         sleep(0.5)
 
-        if self.is_starting_from_bottom(self.starts_at, wire_idx):
+        if is_starting_from_bottom(
+            self.starts_at, wind_order, self.slot_index_matrix[wire_idx]
+        ):
             # starting from the bottom
             self.move_motor(2, self.m2_zero + math.pi)
-            sleep(15)
+            if not self.simulation:
+                sleep(15)
 
         for i in range(self.starts_at, int(self.slot_count / 3)):
+            clockwise = wind_order[i]
             if self.starts_at == i and i != 0:
-                self.prevent_collision()
+                self.prevent_collision(clockwise)
                 sleep(0.3)
 
                 self.move_motor(0, self.m1_rotating_position)
 
-            clockwise = wind_order[i]
             slot_idx = self.slot_index_matrix[wire_idx][i]
 
             self.wind_slot(slot_idx, clockwise, i)
