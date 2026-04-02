@@ -174,4 +174,4 @@ cython_debug/
 .pypirc
 
 motors.db
-*.blend1
+*.blend1.DS_Store
